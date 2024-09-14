@@ -15,6 +15,10 @@ use sway_error::error::CompileError;
 use sway_types::{ident::Ident, span::Span, IdentUnique};
 
 impl<'cfg> ControlFlowGraph<'cfg> {
+    /// Constructs a return path control flow graph from a list of AST nodes.
+    /// 
+    /// Performs a depth-first traversal over the AST and connects nodes to build the control flow graph.
+    /// Returns an error if there are any issues while constructing the graph.
     pub(crate) fn construct_return_path_graph<'eng: 'cfg>(
         engines: &'eng Engines,
         module_nodes: &[ty::TyAstNode],
@@ -22,7 +26,7 @@ impl<'cfg> ControlFlowGraph<'cfg> {
         let mut errors = vec![];
 
         let mut graph = ControlFlowGraph::new(engines);
-        // do a depth first traversal and cover individual inner ast nodes
+        // Perform a depth-first traversal and cover individual inner AST nodes.
         let mut leaves = vec![];
         for ast_entrypoint in module_nodes {
             match connect_node(engines, ast_entrypoint, &mut graph, &leaves) {
@@ -43,12 +47,11 @@ impl<'cfg> ControlFlowGraph<'cfg> {
         }
     }
 
-    /// This function looks through the control flow graph and ensures that all paths that are
-    /// required to return a value do, indeed, return a value of the correct type.
-    /// It does this by checking every function declaration in both the methods namespace
-    /// and the functions namespace and validating that all paths leading to the function exit node
-    /// return the same type. Additionally, if a function has a return type, all paths must indeed
-    /// lead to the function exit node.
+    /// Analyzes the control flow graph to ensure all paths that are required to return a value
+    /// do return a value of the correct type.
+    /// 
+    /// It checks each function in both the methods namespace and functions namespace
+    /// to validate that all paths leading to the function exit node have the correct return type.
     pub(crate) fn analyze_return_paths(&self, engines: &Engines) -> Vec<CompileError> {
         let mut errors = vec![];
         for (
@@ -60,7 +63,7 @@ impl<'cfg> ControlFlowGraph<'cfg> {
             },
         ) in &self.namespace.function_namespace
         {
-            // For every node connected to the entry point
+            // For every node connected to the entry point, ensure all paths reach the exit point.
             errors.append(&mut self.ensure_all_paths_reach_exit(
                 engines,
                 *entry_point,
@@ -72,6 +75,11 @@ impl<'cfg> ControlFlowGraph<'cfg> {
         errors
     }
 
+    /// Ensures that all paths from the entry point of a function reach the exit point.
+    /// 
+    /// Checks if all execution paths in a function reach the exit node.
+    /// If a path does not reach the exit and the function has a non-unit return type,
+    /// it reports an error.
     fn ensure_all_paths_reach_exit(
         &self,
         engines: &Engines,
@@ -84,6 +92,7 @@ impl<'cfg> ControlFlowGraph<'cfg> {
         let mut visited = vec![];
         let mut errors = vec![];
         while !rovers.is_empty() && rovers[0] != exit_point {
+            // Remove the exit point from rovers if present
             rovers.retain(|idx| *idx != exit_point);
             let mut next_rovers = vec![];
             let mut last_discovered_span;
@@ -113,8 +122,6 @@ impl<'cfg> ControlFlowGraph<'cfg> {
                     };
                     let function_name: Ident = function_name.into();
                     errors.push(CompileError::PathDoesNotReturn {
-                        // TODO: unwrap_to_node is a shortcut. In reality, the graph type should be
-                        // different. To save some code duplication,
                         span,
                         function_name: function_name.clone(),
                         ty: engines.help_out(return_ty).to_string(),
@@ -122,6 +129,7 @@ impl<'cfg> ControlFlowGraph<'cfg> {
                 }
                 next_rovers.append(&mut neighbors);
             }
+            // Avoid revisiting nodes
             next_rovers.retain(|idx| !visited.contains(idx));
             rovers = next_rovers;
         }
@@ -132,12 +140,16 @@ impl<'cfg> ControlFlowGraph<'cfg> {
 
 /// The resulting edges from connecting a node to the graph.
 enum NodeConnection {
-    /// This represents a node that steps on to the next node.
+    /// Represents a node that steps on to the next node.
     NextStep(Vec<NodeIndex>),
-    /// This represents a return or implicit return node, which aborts the stepwise flow.
+    /// Represents a return or implicit return node, which aborts the stepwise flow.
     Return(NodeIndex),
 }
 
+/// Connects an AST node to the control flow graph.
+///
+/// Analyzes the given AST node and connects it to the current graph based on its content.
+/// Returns a `NodeConnection` that indicates the next steps in the control flow.
 fn connect_node<'eng: 'cfg, 'cfg>(
     engines: &'eng Engines,
     node: &ty::TyAstNode,
@@ -145,6 +157,7 @@ fn connect_node<'eng: 'cfg, 'cfg>(
     leaves: &[NodeIndex],
 ) -> Result<NodeConnection, Vec<CompileError>> {
     match &node.content {
+        // Handles explicit and implicit return expressions.
         ty::TyAstNodeContent::Expression(ty::TyExpression {
             expression: ty::TyExpressionVariant::Return(..),
             ..
@@ -159,36 +172,44 @@ fn connect_node<'eng: 'cfg, 'cfg>(
             }
             Ok(NodeConnection::Return(this_index))
         }
+        // Handles while loop expressions.
         ty::TyAstNodeContent::Expression(ty::TyExpression {
             expression: ty::TyExpressionVariant::WhileLoop { .. },
             ..
         }) => {
             // An abridged version of the dead code analysis for a while loop
             // since we don't really care about what the loop body contains when detecting
-            // divergent paths
+            // divergent paths.
             let node = graph.add_node(ControlFlowGraphNode::from_node(node));
             for leaf in leaves {
                 graph.add_edge(*leaf, node, "while loop entry".into());
             }
             Ok(NodeConnection::NextStep(vec![node]))
         }
+        // Handles general expressions.
         ty::TyAstNodeContent::Expression(ty::TyExpression { .. }) => {
             let entry = graph.add_node(ControlFlowGraphNode::from_node(node));
-            // insert organizational dominator node
-            // connected to all current leaves
+            // Connects all current leaves to the new entry node.
             for leaf in leaves {
                 graph.add_edge(*leaf, entry, "".into());
             }
             Ok(NodeConnection::NextStep(vec![entry]))
         }
+        // Handles side effects.
         ty::TyAstNodeContent::SideEffect(_) => Ok(NodeConnection::NextStep(leaves.to_vec())),
+        // Handles declarations by connecting them accordingly.
         ty::TyAstNodeContent::Declaration(decl) => Ok(NodeConnection::NextStep(
             connect_declaration(engines, node, decl, graph, leaves)?,
         )),
+        // Handles error nodes by skipping them.
         ty::TyAstNodeContent::Error(_, _) => Ok(NodeConnection::NextStep(vec![])),
     }
 }
 
+/// Connects a declaration to the control flow graph.
+///
+/// Analyzes the given declaration and connects it to the current graph based on its type.
+/// Returns the resulting nodes after connection.
 fn connect_declaration<'eng: 'cfg, 'cfg>(
     engines: &'eng Engines,
     node: &ty::TyAstNode,
@@ -198,6 +219,7 @@ fn connect_declaration<'eng: 'cfg, 'cfg>(
 ) -> Result<Vec<NodeIndex>, Vec<CompileError>> {
     let decl_engine = engines.de();
     match decl {
+        // These declarations do not affect control flow and are returned as they are.
         ty::TyDecl::TraitDecl(_)
         | ty::TyDecl::AbiDecl(_)
         | ty::TyDecl::StructDecl(_)
@@ -207,6 +229,7 @@ fn connect_declaration<'eng: 'cfg, 'cfg>(
         | ty::TyDecl::TypeAliasDecl(_)
         | ty::TyDecl::TraitTypeDecl(_)
         | ty::TyDecl::GenericTypeForFunctionScope(_) => Ok(leaves.to_vec()),
+        // Handles variable, constant, and configurable declarations.
         ty::TyDecl::VariableDecl(_)
         | ty::TyDecl::ConstantDecl(_)
         | ty::TyDecl::ConfigurableDecl(_) => {
@@ -216,6 +239,7 @@ fn connect_declaration<'eng: 'cfg, 'cfg>(
             }
             Ok(vec![entry_node])
         }
+        // Handles function declarations.
         ty::TyDecl::FunctionDecl(ty::FunctionDecl { decl_id, .. }) => {
             let fn_decl = decl_engine.get_function(decl_id);
             let entry_node = graph.add_node(ControlFlowGraphNode::from_node(node));
@@ -225,6 +249,7 @@ fn connect_declaration<'eng: 'cfg, 'cfg>(
             connect_typed_fn_decl(engines, &fn_decl, graph, entry_node)?;
             Ok(leaves.to_vec())
         }
+        // Handles trait implementations.
         ty::TyDecl::ImplSelfOrTrait(ty::ImplSelfOrTrait { decl_id, .. }) => {
             let impl_trait = decl_engine.get_impl_self_or_trait(decl_id);
             let ty::TyImplSelfOrTrait {
@@ -238,15 +263,14 @@ fn connect_declaration<'eng: 'cfg, 'cfg>(
             connect_impl_trait(engines, trait_name, graph, items, entry_node)?;
             Ok(leaves.to_vec())
         }
+        // Skips error recovery nodes.
         ty::TyDecl::ErrorRecovery(..) => Ok(leaves.to_vec()),
     }
 }
 
-/// Implementations of traits are top-level things that are not conditional, so
-/// we insert an edge from the function's starting point to the declaration to show
-/// that the declaration was indeed at some point implemented.
-/// Additionally, we insert the trait's methods into the method namespace in order to
-/// track which exact methods are dead code.
+/// Connects the implementation of a trait to the control flow graph.
+///
+/// Inserts trait methods into the graph and tracks which methods are dead code.
 fn connect_impl_trait<'eng: 'cfg, 'cfg>(
     engines: &'eng Engines,
     trait_name: &CallPath,
@@ -256,7 +280,7 @@ fn connect_impl_trait<'eng: 'cfg, 'cfg>(
 ) -> Result<(), Vec<CompileError>> {
     let decl_engine = engines.de();
     let mut methods_and_indexes = vec![];
-    // insert method declarations into the graph
+    // Insert method declarations into the graph
     for item in items {
         match item {
             TyImplItem::Fn(method_decl_ref) => {
@@ -268,8 +292,8 @@ fn connect_impl_trait<'eng: 'cfg, 'cfg>(
                     engines,
                 });
                 graph.add_edge(entry_node, fn_decl_entry_node, "".into());
-                // connect the impl declaration node to the functions themselves, as all trait functions are
-                // public if the trait is in scope
+                // Connects the implementation declaration node to the functions themselves, 
+                // as all trait functions are public if the trait is in scope.
                 connect_typed_fn_decl(engines, &fn_decl, graph, fn_decl_entry_node)?;
                 methods_and_indexes.push((fn_decl.name.clone(), fn_decl_entry_node));
             }
@@ -284,18 +308,9 @@ fn connect_impl_trait<'eng: 'cfg, 'cfg>(
     Ok(())
 }
 
-/// The strategy here is to populate the trait namespace with just one singular trait
-/// and if it is ever implemented, by virtue of type checking, we know all interface points
-/// were met.
-/// Upon implementation, we can populate the methods namespace and track dead functions that way.
-/// TL;DR: At this point, we _only_ track the wholistic trait declaration and not the functions
-/// contained within.
+/// Connects a typed function declaration to the control flow graph.
 ///
-/// The trait node itself has already been added (as `entry_node`), so we just need to insert that
-/// node index into the namespace for the trait.
-
-/// When connecting a function declaration, we are inserting a new root node into the graph that
-/// has no entry points, since it is just a declaration.
+/// Inserts a new root node into the graph for the function declaration.
 /// When something eventually calls it, it gets connected to the declaration.
 fn connect_typed_fn_decl<'eng: 'cfg, 'cfg>(
     engines: &'eng Engines,
@@ -324,6 +339,10 @@ fn connect_typed_fn_decl<'eng: 'cfg, 'cfg>(
 
 type ReturnStatementNodes = Vec<NodeIndex>;
 
+/// Performs a depth-first insertion of code block contents into the control flow graph.
+///
+/// This is used to insert the nodes of a code block into the control flow graph,
+/// following the flow of execution.
 fn depth_first_insertion_code_block<'eng: 'cfg, 'cfg>(
     engines: &'eng Engines,
     node_content: &ty::TyCodeBlock,
